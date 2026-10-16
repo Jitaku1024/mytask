@@ -64,6 +64,24 @@
 .authmessage,.autherror{font-size:13px;color:#bb4752;line-height:1.6}.settingsLink{margin-top:10px;color:#89909d}
 .syncfooter{display:flex;flex-direction:column;gap:7px}.syncfooter small{font-size:11px;color:#89909d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .syncfooter .secondary{font-size:12px}
+
+/* v0.8: Gmail-style viewport shell. Only the task-list pane scrolls. */
+html,body{height:100%;overflow:hidden}
+#root{height:100%;min-height:0}
+.shell{height:100dvh;min-height:0;overflow:hidden}
+.sidebar{height:100%;min-height:0;overflow:hidden;padding-top:16px;padding-bottom:16px}
+.sidebarbottom{flex-shrink:0}
+.main{height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding-bottom:10px}
+.main-header{flex:0 0 auto}
+.main-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;padding-bottom:20px}
+.main-scroll:focus{outline:none}
+@media(max-width:720px){
+  .shell{height:100dvh;min-height:0;padding-bottom:calc(64px + env(safe-area-inset-bottom))}
+  .sidebar{height:calc(64px + env(safe-area-inset-bottom));overflow:visible;padding:7px 8px env(safe-area-inset-bottom)}
+  .main{height:100%;min-height:0;padding-bottom:4px}
+  .main-scroll{scrollbar-gutter:auto;padding-bottom:20px}
+}
+@media(prefers-reduced-motion:reduce){.main-scroll{scroll-behavior:auto}}
 </style></head><body>
 <div id="root" style="padding:32px;font-family:-apple-system,sans-serif"><h1>まいタスク</h1><p>読み込み中です。MacのSafariまたはChromeで開いてください。</p></div>
 <script>
@@ -140,7 +158,7 @@ let inner=`<div class="field"><label>件名（必須）</label><input id="formNa
 if(kind!=='group')inner+=`<div class="field"><label>グループ（必須）</label><select id="formGroup">${options([...db.groups].sort(groupSort),grp,'選択してください')}</select></div><div class="field"><label>タスク（${kind==='task'?'親タスク':'未選択なら新しいタスク'}）</label><select id="formProject">${options(projectsIn(grp),pid,'指定しない（新しいタスク）')}</select></div><div class="field"><label>納期（任意）</label><input id="formDue" type="date" value="${safe(it?.due||'')}"></div>`;
 if(kind!=='group')inner+=`<div id="repeatSection"><div class="field"><label>繰り返し（タスクのみ）</label><select id="formRepeat"><option value="">繰り返さない</option>${[['daily','毎日'],['weekly','毎週'],['monthly','毎月'],['yearly','毎年']].map(([v,n])=>`<option value="${v}" ${it?.repeat?.freq===v?'selected':''}>${n}</option>`).join('')}</select></div><div class="field repeat-extra"><label>初回の生成日</label><input id="formNext" type="date" value="${safe(it?.repeat?.next||addDays(day(),1))}"></div>${editing&&kind==='project'?`<div class="fieldset repeat-extra"><div class="hint">複製するサブタスクを選択</div>${tasksIn(it.id).map(t=>`<label class="minirow"><input type="checkbox" data-repeat-child="${t.id}" ${it.repeat?.childIds?.includes(t.id)?'checked':''}>${safe(t.name)}</label>`).join('')||'<div class="hint">サブタスクなし（タスクのみ繰り返し可能）</div>'}</div>`:'<p class="hint repeat-extra">サブタスクはタスク作成後に選択できます。</p>'}</div>`;
 return `<div class="overlay"><div class="modal"><h2>${editing?type+'を編集':type+'の追加'}</h2>${inner}<div class="modalfooter"><button class="secondary" data-action="close">キャンセル</button><button class="primary" data-action="saveForm">保存する</button></div></div></div>`}
-function render(){if(!remoteReady){renderAuth();return}cycle();scheduleRepeat();const inner=page==='today'?renderToday():page==='projects'?renderProjects():renderPlan();const enter=animateNextView&&!reducedMotion();animateNextView=false;document.getElementById('root').innerHTML=`<div class="shell">${nav()}<main class="main ${enter?'view-enter':''}">${inner}</main></div>${modal?editModal():''}${toastMsg?`<div id="toast" class="toast">${safe(toastMsg)}</div>`:''}`;if(modal?.mode==='edit'||modal?.mode==='add')bindForm()}
+function render(){if(!remoteReady){renderAuth();return}const previousScroll=document.querySelector('.main-scroll')?.scrollTop||0;cycle();scheduleRepeat();const inner=page==='today'?renderToday():page==='projects'?renderProjects():renderPlan();const enter=animateNextView&&!reducedMotion();const resetScroll=animateNextView;animateNextView=false;const boundary='</div></div>';const cut=inner.indexOf(boundary);if(cut<0)throw Error('画面のヘッダーが見つかりません');const head=inner.slice(0,cut+boundary.length),body=inner.slice(cut+boundary.length);document.getElementById('root').innerHTML=`<div class="shell">${nav()}<main class="main ${enter?'view-enter':''}"><div class="main-header">${head}</div><div class="main-scroll" tabindex="0" aria-label="タスク一覧のスクロール領域">${body}</div></main></div>${modal?editModal():''}${toastMsg?`<div id="toast" class="toast">${safe(toastMsg)}</div>`:''}`;const scroller=document.querySelector('.main-scroll');if(scroller&&!resetScroll)scroller.scrollTop=previousScroll;if(modal?.mode==='edit'||modal?.mode==='add')bindForm()}
 // FLIP: capture old rectangles, then animate new positions using compositor transforms.
 function captureRects(selector){const out=new Map();document.querySelectorAll(selector).forEach(el=>{const key=el.dataset.todayId||el.dataset.itemId;if(key)out.set(key,el.getBoundingClientRect())});return out}
 function animateReflow(before,selector,keyAttr){if(reducedMotion())return;document.querySelectorAll(selector).forEach(el=>{const old=before.get(el.dataset[keyAttr]);if(!old)return;const now=el.getBoundingClientRect();const dx=old.left-now.left,dy=old.top-now.top;if(Math.abs(dx)<.5&&Math.abs(dy)<.5)return;el.animate([{transform:`translate(${dx}px,${dy}px)`},{transform:'translate(0,0)'}],{duration:340,easing:'cubic-bezier(.22,1,.36,1)'});})}
