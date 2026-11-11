@@ -196,11 +196,11 @@ async function checkRemote(){const row=await fetchRemote();if(!row||row.revision
 
 function queueSync(){
  if(!remoteReady||!account)return;
+ if(conflict){setStatus('同期の競合：復旧方法を選択してください',true);return}
  dirty=true;
  let prior;try{prior=JSON.parse(localStorage.getItem(localPendingKey())||'null')}catch{}
  const base=validData(prior?.base)&&prior.baseRevision===cloudRevision?prior.base:(syncBase||db);
  localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,base:copy(base),payload:db}));
- if(conflict){setStatus('同期の競合：復旧方法を選択してください',true);return}
  setStatus('保存中…');clearTimeout(saveTimer);
  saveTimer=setTimeout(()=>{flushSync().catch(e=>setStatus('未同期：'+e.message,true))},450);
 }
