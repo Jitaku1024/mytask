@@ -100,7 +100,7 @@ html,body{height:100%;overflow:hidden}
 (()=>{'use strict';
 const KEY='mytask-mac-beta-v2';
 const CLOUD_CONFIG_KEY='mytask-v07-supabase', SESSION_KEY='mytask-v07-session';
-let config=null, session=null, account=null, cloudRevision=0, remoteReady=false, dirty=false, saveTimer=null, syncing=false, syncAgain=false, cloudError='', authView='login', authMessage='', authBusy=false, remotePoll=null, conflict=false;
+let config=null, session=null, account=null, cloudRevision=0, remoteReady=false, dirty=false, saveTimer=null, syncing=false, syncAgain=false, cloudError='', authView='login', authMessage='', authBusy=false, remotePoll=null, conflict=false, syncBase=null;
 const DEFAULT_CONFIG={url:'https://yieamyshjtrwettnihji.supabase.co',key:'sb_publishable_navQOlEQsF0H25aRNU8sDg_aou63fLj'};
 try{config=JSON.parse(localStorage.getItem(CLOUD_CONFIG_KEY)||'null')}catch{}
 if(!config)config=DEFAULT_CONFIG;
@@ -116,11 +116,123 @@ async function refreshSession(){if(!session?.refresh_token)return false;try{cons
 async function ensureSession(){if(!session?.access_token)throw Error('ログインしてください');if((session.expires_at||0)<Math.floor(Date.now()/1000)+65){if(!await refreshSession()){storeSession(null);account=null;remoteReady=false;renderAuth();throw Error('ログイン期限が切れました。もう一度ログインしてください')}}}
 async function authenticatedApi(path,opts){await ensureSession();return api(path,opts)}
 async function fetchRemote(){const rows=await authenticatedApi('/rest/v1/mytask_data?select=payload,revision&limit=1');return rows?.[0]||null}
-async function startAccount(){account=session?.user;if(!account?.id){const user=await authenticatedApi('/auth/v1/user');account=user}remoteReady=false;renderAuth('データを読み込んでいます…');const row=await fetchRemote();const pending=localStorage.getItem(localPendingKey());if(pending){let cached;try{cached=JSON.parse(pending)}catch{}if(validData(cached?.payload)&&cached.baseRevision===(row?.revision||0)){db=cached.payload;cloudRevision=row?.revision||0;remoteReady=true;dirty=true;render();queueSync();return}conflict=true;cloudError='別端末の変更と未同期データが衝突しました。バックアップしてから復元してください。'}
-if(row){if(!validData(row.payload))throw Error('保存データの形式が正しくありません');db=row.payload;cloudRevision=row.revision}else{db=initialEmpty();cloudRevision=0}dirty=false;remoteReady=true;render();if(cloudError)setStatus(cloudError,true);if(!remotePoll){remotePoll=setInterval(()=>{if(remoteReady&&!dirty&&!syncing&&!modal&&!conflict)checkRemote().catch(e=>setStatus('同期確認エラー: '+e.message,true))},12000)}}
-async function checkRemote(){const row=await fetchRemote();if(!row||row.revision===cloudRevision)return;if(!validData(row.payload))throw Error('不正なクラウドデータ');db=row.payload;cloudRevision=row.revision;render();setStatus('同期済み')}
-function queueSync(){if(!remoteReady||!account)return;dirty=true;localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,payload:db}));setStatus('保存中…');clearTimeout(saveTimer);saveTimer=setTimeout(()=>{flushSync().catch(e=>setStatus('未同期：'+e.message,true))},450)}
-async function flushSync(){if(syncing){syncAgain=true;return}if(!dirty||conflict||!remoteReady)return;syncing=true;syncAgain=false;const snapshot=JSON.stringify(db),expected=cloudRevision;try{await ensureSession();let rows;if(expected===0){rows=await api('/rest/v1/mytask_data',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({user_id:account.id,payload:JSON.parse(snapshot),revision:1})})}else{rows=await api('/rest/v1/mytask_data?user_id=eq.'+encodeURIComponent(account.id)+'&revision=eq.'+expected,{method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify({payload:JSON.parse(snapshot),revision:expected+1})})}if(!rows?.length){conflict=true;throw Error('別端末と編集が競合しました。JSONバックアップ後、再読み込みしてください')}cloudRevision=rows[0].revision;if(JSON.stringify(db)===snapshot){dirty=false;localStorage.removeItem(localPendingKey());setStatus('同期済み')}else{dirty=true;localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,payload:db}));syncAgain=true}}catch(e){if(e.message.includes('duplicate key')||e.message.includes('already exists')){conflict=true;e=Error('別端末と編集が競合しました。JSONバックアップ後、再読み込みしてください')}setStatus('未同期：'+e.message,true)}finally{syncing=false;if(syncAgain&&!conflict){syncAgain=false;queueSync()}}}
+
+const copy=x=>JSON.parse(JSON.stringify(x));
+const equal=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+function mergeVersions(base,local,remote){
+ if(!validData(base)||!validData(local)||!validData(remote))return null;
+ const out=copy(remote);
+ const pick=(a,b,c)=>equal(b,c)?[true,b]:equal(a,b)?[true,c]:equal(a,c)?[true,b]:[false,null];
+ for(const key of ['groups','projects','tasks']){
+  const maps=[base,local,remote].map(d=>new Map(d[key].map(x=>[x.id,x])));
+  const ids=new Set([...maps[0].keys(),...maps[1].keys(),...maps[2].keys()]);out[key]=[];
+  for(const id of ids){
+   const [a,b,c]=maps.map(m=>m.get(id));let [ok,v]=pick(a,b,c);
+   if(!ok&&a&&b&&c){
+    const merged={...c};ok=true;
+    for(const field of new Set([...Object.keys(a),...Object.keys(b),...Object.keys(c)])){
+     const [success,value]=pick(a[field],b[field],c[field]);
+     if(!success){ok=false;break}
+     if(value===undefined)delete merged[field];else merged[field]=value;
+    }
+    v=merged;
+   }
+   if(!ok)return null;if(v!==undefined)out[key].push(v);
+  }
+ }
+ for(const key of ['today','tomorrow']){
+  const sets=[base,local,remote].map(d=>new Set(d[key]));out[key]=[];
+  for(const id of new Set([...sets[0],...sets[1],...sets[2]])){
+   const [ok,checked]=pick(...sets.map(x=>x.has(id)));
+   if(!ok)return null;if(checked)out[key].push(id);
+  }
+ }
+ const [ok,date]=pick(base.date,local.date,remote.date);
+ if(!ok)return null;out.date=date;return out;
+}
+function downloadRecovery(data,filename){
+ const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;a.click();
+ setTimeout(()=>URL.revokeObjectURL(a.href),3000);
+}
+function recoverySnapshot(local,remote){
+ try{localStorage.setItem('mytask-recovery-'+Date.now(),JSON.stringify({local,remote}))}catch{}
+}
+async function resolveConflict(action){
+ const saved=localStorage.getItem(localPendingKey());let cached;try{cached=JSON.parse(saved||'null')}catch{}
+ const local=validData(cached?.payload)?cached.payload:db;
+ const row=await fetchRemote(),remote=row?.payload||initialEmpty();
+ if(!validData(remote))throw Error('クラウドの形式が正しくありません');
+ recoverySnapshot(local,remote);
+ if(action==='downloadLocal'){downloadRecovery(local,'mytask-unsynced.json');return}
+ if(action==='downloadCloud'){downloadRecovery(remote,'mytask-cloud.json');return}
+ if(action==='local'){db=copy(local);cloudRevision=row?.revision||0;syncBase=copy(remote);conflict=false;dirty=true;modal=null;queueSync();render();return}
+ if(action==='cloud'){db=copy(remote);cloudRevision=row?.revision||0;syncBase=copy(remote);conflict=false;dirty=false;modal=null;localStorage.removeItem(localPendingKey());render();setStatus('同期済み')}
+}
+async function startAccount(){
+ account=session?.user;if(!account?.id)account=await authenticatedApi('/auth/v1/user');
+ remoteReady=false;renderAuth('データを読み込んでいます…');
+ const row=await fetchRemote(),remote=row?.payload||initialEmpty();
+ if(!validData(remote))throw Error('保存データの形式が正しくありません');
+ db=copy(remote);syncBase=copy(remote);cloudRevision=row?.revision||0;dirty=false;conflict=false;
+ let pending;try{pending=JSON.parse(localStorage.getItem(localPendingKey())||'null')}catch{}
+ if(validData(pending?.payload)){
+  if(equal(pending.payload,remote))localStorage.removeItem(localPendingKey());
+  else if(pending.baseRevision===cloudRevision){
+   db=copy(pending.payload);dirty=true;
+   if(validData(pending.base))syncBase=copy(pending.base);
+  }else if(validData(pending.base)){
+   const merged=mergeVersions(pending.base,pending.payload,remote);
+   if(merged){db=merged;dirty=!equal(db,remote);if(!dirty)localStorage.removeItem(localPendingKey())}
+   else{conflict=true;recoverySnapshot(pending.payload,remote)}
+  }else{conflict=true;recoverySnapshot(pending.payload,remote)}
+ }
+ remoteReady=true;render();
+ if(conflict)setStatus('同期の競合：復旧方法を選択してください',true);
+ else if(dirty)queueSync();
+ if(!remotePoll)remotePoll=setInterval(()=>{if(remoteReady&&!dirty&&!syncing&&!modal&&!conflict)checkRemote().catch(e=>setStatus('同期確認エラー: '+e.message,true))},12000);
+}
+async function checkRemote(){const row=await fetchRemote();if(!row||row.revision===cloudRevision||dirty||syncing||conflict)return;if(!validData(row.payload))throw Error('不正なクラウドデータ');db=copy(row.payload);cloudRevision=row.revision;syncBase=copy(db);render();setStatus('同期済み')}
+
+function queueSync(){
+ if(!remoteReady||!account)return;
+ dirty=true;
+ let prior;try{prior=JSON.parse(localStorage.getItem(localPendingKey())||'null')}catch{}
+ const base=validData(prior?.base)&&prior.baseRevision===cloudRevision?prior.base:(syncBase||db);
+ localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,base:copy(base),payload:db}));
+ if(conflict){setStatus('同期の競合：復旧方法を選択してください',true);return}
+ setStatus('保存中…');clearTimeout(saveTimer);
+ saveTimer=setTimeout(()=>{flushSync().catch(e=>setStatus('未同期：'+e.message,true))},450);
+}
+async function flushSync(){
+ if(syncing){syncAgain=true;return}
+ if(!dirty||conflict||!remoteReady)return;
+ syncing=true;syncAgain=false;
+ const snapshot=JSON.stringify(db),expected=cloudRevision;
+ try{
+  await ensureSession();let rows;
+  if(expected===0)rows=await api('/rest/v1/mytask_data',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({user_id:account.id,payload:JSON.parse(snapshot),revision:1})});
+  else rows=await api('/rest/v1/mytask_data?user_id=eq.'+encodeURIComponent(account.id)+'&revision=eq.'+expected,{method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify({payload:JSON.parse(snapshot),revision:expected+1})});
+  if(!rows?.length)throw Error('REVISION_CONFLICT');
+  cloudRevision=rows[0].revision;syncBase=JSON.parse(snapshot);
+  if(equal(db,syncBase)){dirty=false;localStorage.removeItem(localPendingKey());setStatus('同期済み')}
+  else{localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,base:syncBase,payload:db}));syncAgain=true}
+ }catch(e){
+  if(e.message==='REVISION_CONFLICT'||e.message.includes('duplicate key')||e.message.includes('already exists')){
+   try{
+    const row=await fetchRemote(),remote=row?.payload||initialEmpty();
+    if(!validData(remote))throw Error('クラウドの形式が不正です');
+    const local=copy(db),merged=mergeVersions(syncBase||local,local,remote);
+    if(merged){
+     db=merged;cloudRevision=row?.revision||0;syncBase=copy(remote);dirty=!equal(db,remote);
+     if(dirty){localStorage.setItem(localPendingKey(),JSON.stringify({baseRevision:cloudRevision,base:syncBase,payload:db}));syncAgain=true}
+     else{localStorage.removeItem(localPendingKey());setStatus('同期済み')}
+     render();
+    }else{conflict=true;recoverySnapshot(local,remote);setStatus('同期の競合：復旧方法を選択してください',true);render()}
+   }catch(inner){setStatus('未同期：'+inner.message,true)}
+  }else setStatus('未同期：'+e.message,true);
+ }finally{syncing=false;if(syncAgain&&!conflict){syncAgain=false;queueSync()}}
+}
 function authLayout(body){document.getElementById('root').innerHTML=`<div class="authwrap"><div class="authcard"><div class="authbrand">まいタスク <small>v0.7</small></div>${body}</div></div>`}
 function renderAuth(message=''){if(!config?.url||!config?.key){authLayout(`<h2>最初の接続設定</h2><p class="hint">SupabaseのプロジェクトURLと公開用キーを設定します。<strong>service_role / secretキーは絶対に入力しないでください。</strong></p><div class="field"><label>Project URL</label><input id="cfgUrl" type="url" placeholder="https://xxxxx.supabase.co" value="${safe(config?.url||'')}"></div><div class="field"><label>Publishable key または anon key</label><input id="cfgKey" placeholder="sb_publishable_... / eyJ..." value="${safe(config?.key||'')}"></div><button class="primary full" data-auth="configure">接続設定を保存</button><p class="hint">先に同梱の README と setup.sql の手順を済ませてください。</p>`);return}
 if(message){authLayout(`<h2>まいタスク</h2><p class="hint">${safe(message)}</p>${cloudError?`<p class="autherror">${safe(cloudError)}</p>`:''}<button class="secondary full" data-auth="retry">再試行</button>`);return}
@@ -157,7 +269,7 @@ function repeatOnCompletion(p){if(!p.repeat?.freq||p.repeat.generatedNextId)retu
 function save(redraw=true){queueSync();if(redraw)render()}
 function notify(msg){toastMsg=msg;render();setTimeout(()=>{toastMsg='';document.getElementById('toast')?.remove()},2500)}
 const I={sun:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',folder:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 012-2h5l2 2h7a2 2 0 012 2v10H3z"/></svg>',calendar:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 2v6m10-6v6M3 10h18"/></svg>'};
-function nav(){return `<aside class="sidebar"><div class="brand">まいタスク <span style="font-size:11px;color:#acb3bc">β</span></div><button class="nav ${page==='today'?'active':''}" data-action="nav" data-page="today">${I.sun}<span>今日のタスク</span></button><button class="nav ${page==='projects'?'active':''}" data-action="nav" data-page="projects">${I.folder}<span>タスク一覧</span></button><button class="nav ${page==='plan'?'active':''}" data-action="nav" data-page="plan">${I.calendar}<span>今日・明日の予定</span></button><button class="nav addnav" data-action="add"> <span class="plusicon">＋</span><span>タスクを追加</span></button><div class="sidebarbottom"><div class="syncfooter"><small>${safe(account?.email||'')}</small><small id="syncstate">${cloudError?'未同期（確認が必要）':dirty?'保存中…':'同期済み'}</small><button class="secondary" data-action="backup">バックアップ</button><button class="secondary" data-action="logout">ログアウト</button></div></div></aside>`}
+function nav(){return `<aside class="sidebar"><div class="brand">まいタスク <span style="font-size:11px;color:#acb3bc">β</span></div><button class="nav ${page==='today'?'active':''}" data-action="nav" data-page="today">${I.sun}<span>今日のタスク</span></button><button class="nav ${page==='projects'?'active':''}" data-action="nav" data-page="projects">${I.folder}<span>タスク一覧</span></button><button class="nav ${page==='plan'?'active':''}" data-action="nav" data-page="plan">${I.calendar}<span>今日・明日の予定</span></button><button class="nav addnav" data-action="add"> <span class="plusicon">＋</span><span>タスクを追加</span></button><div class="sidebarbottom"><div class="syncfooter"><small>${safe(account?.email||'')}</small><small id="syncstate">${cloudError?'未同期（確認が必要）':dirty?'保存中…':'同期済み'}</small>${conflict?'<button class="secondary" style="border-color:#c26767;color:#b4494c" data-action="syncConflict">同期を復旧する</button>':''}<button class="secondary" data-action="backup">バックアップ</button><button class="secondary" data-action="logout">ログアウト</button></div></div></aside>`}
 function top(title,subtitle='',back=''){return `<div class="top"><div>${back?`<button class="back" data-action="back">‹ 戻る</button>`:''}<h1 class="title">${safe(title)}</h1><div class="sub">${safe(subtitle)}</div></div></div>`}
 function renderToday(){const items=allItems().filter(x=>db.today.includes(x.id));const undone=items.filter(x=>!x.item.done),done=items.filter(x=>x.item.done);let html=top('今日のタスク',new Date(taskDay()+'T12:00:00').toLocaleDateString('ja-JP',{month:'long',day:'numeric',weekday:'long'}));html+=`<p class="progress">残りタスク <strong>${undone.length}/${items.length}</strong></p>`;if(!items.length)return html+'<div class="empty">今日のタスクはありません。<br>「今日・明日の予定」から追加できます。</div>';html+='<div class="today-list">';let prev='';for(const x of undone){if(x.group.id!==prev){html+=`<div class="today-group">${safe(x.group.name)}</div>`;prev=x.group.id}html+=taskCard(x)}if(done.length){html+='<div class="today-group today-completed-label">完了済み</div>';for(const x of done)html+=taskCard(x)}return html+'</div>'}
 function taskCard(x){return `<div class="item ${x.item.done?'completed':''}" data-today-id="${safe(x.id)}"><input class="check" aria-label="${safe(x.name)}の完了" type="checkbox" data-action="complete" data-id="${x.id}" ${x.item.done?'checked':''}><div class="textpart"><div class="name">${safe(x.name)}</div><div class="meta">${safe(x.group.name)} / ${safe(x.project.name)}${x.item.due?' ・ 納期 '+shortDate(x.item.due):''}</div></div><button class="iconbtn" data-action="edit" data-kind="${x.kind}" data-id="${x.id}" aria-label="${safe(x.name)}の編集メニュー">···</button></div>`}
@@ -166,7 +278,7 @@ function completedLastCards(items,kind){const active=items.filter(x=>!x.done),fi
 function renderProjects(){if(!groupId)return top('タスク一覧','グループを選択してください')+'<button class="secondary" style="margin-bottom:17px" data-action="newGroup">＋ グループを追加</button>'+db.groups.slice().sort(groupSort).map(g=>card(g,'group')).join('')+(db.groups.length?'':'<div class="empty">グループがありません。「グループを追加」から作れます。</div>');let g=group(groupId);if(!g){groupId=null;return renderProjects()}if(!projectId)return top(g.name,'タスク',true)+'<button class="secondary quickadd" data-action="newTask">＋ タスクを追加</button>'+completedLastCards(projectsIn(g.id),'project')+(!projectsIn(g.id).length?'<div class="empty">タスクがありません。「タスクを追加」から作成できます。</div>':'');const p=project(projectId);if(!p){projectId=null;return renderProjects()}return top(p.name,'サブタスク',true)+'<button class="secondary quickadd" data-action="newSubtask">＋ サブタスクを追加</button>'+`<div class="notice">このタスクの完了や納期、繰り返しの設定は、前の画面の「···」から編集できます。</div>`+completedLastCards(tasksIn(p.id),'task')+(!tasksIn(p.id).length?'<div class="empty">サブタスクはありません。タスク単体でも完了できます。</div>':'')}
 function renderPlan(){let html=top('今日・明日の予定');html+='<div class="planhead"><span>タスク</span><span>今日</span><span>明日</span></div>';let prev='';for(const x of allItems()){if(x.item.done)continue;if(prev!==x.group.id){prev=x.group.id;html+=`<div class="grouphead">${safe(x.group.name)}</div>`}html+=`<div class="planrow ${x.kind==='task'?'child':''}"><div class="plabel"><div class="name" style="font-size:13px;font-weight:${x.kind==='project'?700:450}">${safe(x.name)}</div>${x.kind==='task'?`<div class="small">${safe(x.project.name)}</div>`:''}</div><input class="check" type="checkbox" aria-label="今日に追加" data-action="plan" data-date="today" data-id="${x.id}" ${db.today.includes(x.id)?'checked':''}><input class="check" type="checkbox" aria-label="明日に追加" data-action="plan" data-date="tomorrow" data-id="${x.id}" ${db.tomorrow.includes(x.id)?'checked':''}></div>`}return html+'<div class="notice">日付が変わると「明日」のチェックは「今日」に移動します。「今日」の未完了タスクは翌日も残ります。</div>'}
 function options(list,selected,placeholder){return `<option value="">${safe(placeholder)}</option>`+list.map(x=>`<option value="${safe(x.id)}" ${x.id===selected?'selected':''}>${safe(x.name)}</option>`).join('')}
-function editModal(){if(!modal)return '';if(modal.mode==='backup')return `<div class="overlay"><div class="modal"><h2>バックアップ</h2><p class="hint">JSONファイルにすべてのタスクと設定を保存できます。復元すると現在のデータが置き換わります。</p><button class="secondary" data-action="export">データを書き出す</button>${localStorage.getItem(KEY)?`<p class="hint">旧版のデータがこの端末にあります。</p><button class="secondary" data-action="localMigration">旧版v0.6のデータをクラウドへ移す</button>`:''}${conflict?`<p class="autherror">未同期データが競合しています。書き出してからクラウドを再読み込みしてください。</p><button class="secondary" data-action="reloadCloud">クラウドから再読み込み</button>`:''}<div class="field" style="margin-top:18px"><label>バックアップから復元</label><input id="importFile" type="file" accept=".json,application/json"></div><div class="modalfooter"><button class="secondary" data-action="close">閉じる</button><button class="primary" data-action="import">復元する</button></div></div></div>`;
+function editModal(){if(!modal)return '';if(modal.mode==='syncConflict')return `<div class="overlay"><div class="modal"><h2>同期の競合を解決</h2><p class="hint">両方の端末で変更があったため、どちらを採用するか選択してください。変更を消さないよう、先に両方のバックアップを保存できます。</p><button class="secondary" style="width:100%;margin-bottom:8px" data-action="downloadLocal">この端末の未同期データを書き出す</button><button class="secondary" style="width:100%;margin-bottom:15px" data-action="downloadCloud">クラウドのデータを書き出す</button><button class="primary" style="width:100%;margin-bottom:8px" data-action="chooseLocal">この端末の変更を採用して同期</button><button class="secondary" style="width:100%;margin-bottom:8px" data-action="chooseCloud">クラウドの変更を採用</button><button class="secondary" style="width:100%" data-action="close">キャンセル</button></div></div>`;if(modal.mode==='backup')return `<div class="overlay"><div class="modal"><h2>バックアップ</h2><p class="hint">JSONファイルにすべてのタスクと設定を保存できます。復元すると現在のデータが置き換わります。</p><button class="secondary" data-action="export">データを書き出す</button>${localStorage.getItem(KEY)?`<p class="hint">旧版のデータがこの端末にあります。</p><button class="secondary" data-action="localMigration">旧版v0.6のデータをクラウドへ移す</button>`:''}${conflict?`<p class="autherror">未同期データが競合しています。書き出してからクラウドを再読み込みしてください。</p><button class="secondary" data-action="reloadCloud">クラウドから再読み込み</button>`:''}<div class="field" style="margin-top:18px"><label>バックアップから復元</label><input id="importFile" type="file" accept=".json,application/json"></div><div class="modalfooter"><button class="secondary" data-action="close">閉じる</button><button class="primary" data-action="import">復元する</button></div></div></div>`;
 if(modal.mode==='delete')return `<div class="overlay"><div class="modal"><h2>削除の確認</h2><p>「${safe(lookup(modal.id)?.name||group(modal.id)?.name)}」を削除しますか？</p><p class="hint">タスクを削除するとサブタスクも削除されます。この操作は元に戻せません。</p><div class="modalfooter"><button class="secondary" data-action="close">キャンセル</button><button class="primary" style="background:#bb3f4b" data-action="deleteConfirm">削除する</button></div></div></div>`;
 if(modal.mode==='menu')return `<div class="overlay menu-overlay"><div class="modal"><h2>${safe(modal.kind==='group'?'グループ':modal.kind==='project'?'タスク':'サブタスク')}の操作</h2><button class="secondary" style="display:block;width:100%;margin-bottom:10px" data-action="menuEdit">編集</button><button class="secondary danger" style="display:block;width:100%;margin-bottom:10px" data-action="menuDelete">削除</button><button class="secondary" style="display:block;width:100%" data-action="close">閉じる</button></div></div>`;
 const editing=modal.mode==='edit',it=editing?(modal.kind==='group'?group(modal.id):lookup(modal.id)):null;const kind=modal.kind;const grp=editing?(kind==='group'?modal.id:kind==='project'?it.groupId:project(it.projectId)?.groupId):modal.prefGroup||db.groups[0]?.id||'';const pid=editing&&kind==='task'?it.projectId:(modal.prefProject||'');const type=kind==='group'?'グループ':kind==='project'?'タスク':'サブタスク';
@@ -185,7 +297,7 @@ function saveForm(){const name=document.getElementById('formName')?.value.trim()
 function deleteItem(){const {id,kind}=modal;const ids=[];if(kind==='group'){const ps=db.projects.filter(p=>p.groupId===id).map(p=>p.id);ids.push(...ps,...db.tasks.filter(t=>ps.includes(t.projectId)).map(t=>t.id));db.groups=db.groups.filter(g=>g.id!==id);db.projects=db.projects.filter(p=>p.groupId!==id);db.tasks=db.tasks.filter(t=>!ps.includes(t.projectId));groupId=null;projectId=null}else if(kind==='project'){ids.push(id,...tasksIn(id).map(t=>t.id));db.projects=db.projects.filter(p=>p.id!==id);db.tasks=db.tasks.filter(t=>t.projectId!==id);projectId=null}else{ids.push(id);db.tasks=db.tasks.filter(t=>t.id!==id)}db.today=db.today.filter(id=>!ids.includes(id));db.tomorrow=db.tomorrow.filter(id=>!ids.includes(id));for(const p of db.projects)if(p.repeat?.generatedNextId&&ids.includes(p.repeat.generatedNextId))delete p.repeat.generatedNextId;modal=null;save();notify('削除しました')}
 function reorder(src,dst){if(src===dst)return;const source=lookup(src)||group(src),target=lookup(dst)||group(dst);if(!source||!target)return;const kind=db.groups.includes(source)?'group':db.projects.includes(source)?'project':'task';const same=kind==='group'?db.groups.includes(target):kind==='project'?db.projects.includes(target)&&source.groupId===target.groupId:db.tasks.includes(target)&&source.projectId===target.projectId;if(!same)return;const arr=kind==='group'?db.groups:kind==='project'?projectsIn(source.groupId):tasksIn(source.projectId);const ordered=[...arr].sort(groupSort);const s=ordered.findIndex(x=>x.id===src),t=ordered.findIndex(x=>x.id===dst);const [it]=ordered.splice(s,1);ordered.splice(t,0,it);ordered.forEach((x,i)=>x.order=i);save()}
 function exportFile(){const blob=new Blob([JSON.stringify(db,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='mytask-backup-'+day()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)}
-function handle(e){const el=e.target.closest('[data-action]');if(!el)return;const a=el.dataset.action,id=el.dataset.id;switch(a){case'nav':page=el.dataset.page;groupId=null;projectId=null;animateNextView=true;render();break;case'back':if(projectId)projectId=null;else groupId=null;animateNextView=true;render();break;case'open':if(el.dataset.kind==='group'){groupId=id;projectId=null}else if(el.dataset.kind==='project'){projectId=id}animateNextView=true;render();break;case'complete':completeWithMotion(id,el.checked);break;case'plan':{const k=el.dataset.date;if(el.checked)db[k]=[...new Set([...db[k],id])];else db[k]=db[k].filter(x=>x!==id);save()}break;case'add':modal={mode:'add',kind:'project',prefGroup:groupId||db.groups[0]?.id,prefProject:''};render();break;case'edit':modal={mode:'menu',kind:el.dataset.kind,id};render();break;case'menuEdit':modal.mode='edit';render();break;case'menuDelete':modal.mode='delete';render();break;case'close':modal=null;render();break;case'deleteConfirm':deleteItem();break;case'saveForm':saveForm();break;case'backup':modal={mode:'backup'};render();break;case'logout':logout();break;case'reloadCloud':if(confirm('クラウドのデータで現在の画面を再読み込みします。未同期の編集内容は失われます。JSONバックアップを先に保存してください。')){dirty=false;conflict=false;localStorage.removeItem(localPendingKey());startAccount().catch(e=>alert(e.message))}break;case'localMigration':{if(!confirm('このMacの旧バージョンにあるタスクデータで、現在のクラウドデータを上書きします。先にJSONバックアップしてください。'))break;try{const old=JSON.parse(localStorage.getItem(KEY));if(!validData(old))throw Error('旧データが見つかりません');db=old;modal=null;save();notify('旧データを同期しています')}catch(e){alert(e.message)}break}case'export':exportFile();break;case'import':{const f=document.getElementById('importFile')?.files?.[0];if(!f){alert('復元するJSONファイルを選択してください');break}if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))break;f.text().then(t=>{try{const x=JSON.parse(t);if(!Array.isArray(x.groups)||!Array.isArray(x.projects)||!Array.isArray(x.tasks)||!Array.isArray(x.today)||!Array.isArray(x.tomorrow))throw Error();db=x;db.date=day();modal=null;groupId=null;projectId=null;save();notify('復元しました')}catch{alert('バックアップファイルの形式が正しくありません')}})}break;case'newGroup':modal={mode:'add',kind:'group'};render();break;case'newTask':modal={mode:'add',kind:'project',prefGroup:groupId,prefProject:''};render();break;case'newSubtask':modal={mode:'add',kind:'task',prefGroup:groupId,prefProject:projectId};render();break;}}
+function handle(e){const el=e.target.closest('[data-action]');if(!el)return;const a=el.dataset.action,id=el.dataset.id;switch(a){case'nav':page=el.dataset.page;groupId=null;projectId=null;animateNextView=true;render();break;case'back':if(projectId)projectId=null;else groupId=null;animateNextView=true;render();break;case'open':if(el.dataset.kind==='group'){groupId=id;projectId=null}else if(el.dataset.kind==='project'){projectId=id}animateNextView=true;render();break;case'complete':completeWithMotion(id,el.checked);break;case'plan':{const k=el.dataset.date;if(el.checked)db[k]=[...new Set([...db[k],id])];else db[k]=db[k].filter(x=>x!==id);save()}break;case'add':modal={mode:'add',kind:'project',prefGroup:groupId||db.groups[0]?.id,prefProject:''};render();break;case'edit':modal={mode:'menu',kind:el.dataset.kind,id};render();break;case'menuEdit':modal.mode='edit';render();break;case'menuDelete':modal.mode='delete';render();break;case'close':modal=null;render();break;case'deleteConfirm':deleteItem();break;case'saveForm':saveForm();break;case'backup':modal={mode:'backup'};render();break;case'syncConflict':modal={mode:'syncConflict'};render();break;case'downloadLocal':resolveConflict('downloadLocal').catch(e=>alert(e.message));break;case'downloadCloud':resolveConflict('downloadCloud').catch(e=>alert(e.message));break;case'chooseLocal':resolveConflict('local').catch(e=>alert(e.message));break;case'chooseCloud':resolveConflict('cloud').catch(e=>alert(e.message));break;case'logout':logout();break;case'reloadCloud':if(confirm('クラウドのデータで現在の画面を再読み込みします。未同期の編集内容は失われます。JSONバックアップを先に保存してください。')){dirty=false;conflict=false;localStorage.removeItem(localPendingKey());startAccount().catch(e=>alert(e.message))}break;case'localMigration':{if(!confirm('このMacの旧バージョンにあるタスクデータで、現在のクラウドデータを上書きします。先にJSONバックアップしてください。'))break;try{const old=JSON.parse(localStorage.getItem(KEY));if(!validData(old))throw Error('旧データが見つかりません');db=old;modal=null;save();notify('旧データを同期しています')}catch(e){alert(e.message)}break}case'export':exportFile();break;case'import':{const f=document.getElementById('importFile')?.files?.[0];if(!f){alert('復元するJSONファイルを選択してください');break}if(!confirm('現在のデータをバックアップの内容で置き換えます。よろしいですか？'))break;f.text().then(t=>{try{const x=JSON.parse(t);if(!Array.isArray(x.groups)||!Array.isArray(x.projects)||!Array.isArray(x.tasks)||!Array.isArray(x.today)||!Array.isArray(x.tomorrow))throw Error();db=x;db.date=day();modal=null;groupId=null;projectId=null;save();notify('復元しました')}catch{alert('バックアップファイルの形式が正しくありません')}})}break;case'newGroup':modal={mode:'add',kind:'group'};render();break;case'newTask':modal={mode:'add',kind:'project',prefGroup:groupId,prefProject:''};render();break;case'newSubtask':modal={mode:'add',kind:'task',prefGroup:groupId,prefProject:projectId};render();break;}}
 // Add form type logic: a project is created if no project selected; a small task otherwise.
 document.addEventListener('click',e=>{const auth=e.target.closest('[data-auth]');if(auth){authAction(auth.dataset.auth);return}if(!remoteReady)return;if(e.target.closest('.overlay')===e.target){modal=null;render()}else if(e.target.closest('button[data-action="add"]')&&page==='projects'&&!groupId){/* use quick add */}else if(!e.target.matches('input[data-action="complete"],input[data-action="plan"]'))handle(e)});
 document.addEventListener('change',e=>{if(e.target.matches('input[data-action="complete"],input[data-action="plan"]'))handle(e)});
